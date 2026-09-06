@@ -1,3 +1,10 @@
+from prix_loader import load_prix_dvf, prix_par_quartier, MEDIANES_ARR
+from rentabilite import (HypothesesInvest, analyser, analyser_secteurs,
+                         monte_carlo)
+from dataclasses import asdict
+
+
+
 import json
 import numpy as np
 import pandas as pd
@@ -208,8 +215,8 @@ st.divider()
 # ══════════════════════════════════════════════════════════════════════
 # CARTE
 # ══════════════════════════════════════════════════════════════════════
-tab_carte, tab_simu, tab_data, tab_analyse = st.tabs(
-    ["🗺️ Carte", "🧮 Simulateur", "📋 Données", "📈 Analyses"]
+tab_carte, tab_simu, tab_invest, tab_data, tab_analyse = st.tabs(
+    ["🗺️ Carte", "🧮 Simulateur", "💰 Investisseur", "📋 Données", "📈 Analyses"]
 )
 
 with tab_carte:
@@ -530,6 +537,413 @@ with tab_analyse:
         st.info("Un seul millésime disponible dans le jeu de données chargé.")
 
 # ══════════════════════════════════════════════════════════════════════
+
+
+
+with tab_invest:
+    st.subheader("💰 Rentabilité locative par secteur")
+
+    st.info("""
+    **Lecture des résultats** — Le loyer est *plafonné par arrêté* (donnée exacte),
+    mais le prix d'acquisition est une *médiane statistique* avec une dispersion
+    intra-quartier de ± 20 à 25 %. Les rendements sont donc des **ordres de
+    grandeur** : c'est la *hiérarchie entre secteurs* qui est informative,
+    pas la valeur absolue à la décimale.
+    """)
+
+    # ─────────────────── HYPOTHÈSES ───────────────────
+    with st.expander("⚙️ Hypothèses d'investissement", expanded=True):
+        h1, h2, h3, h4 = st.columns(4)
+
+        with h1:
+            st.markdown("**Acquisition**")
+            frais_notaire = st.slider("Frais de notaire (%)", 2.0, 9.0, 7.5, .1)
+            frais_agence = st.slider("Frais d'agence (%)", 0.0, 6.0, 4.0, .5)
+            travaux_m2 = st.number_input("Travaux (€/m²)", 0, 3000, 300, 50)
+            mobilier_m2 = st.number_input(
+                "Mobilier (€/m²)", 0, 800,
+                250 if meuble == "meublé" else 0, 25,
+                help="Obligatoire en meublé : liste minimale réglementaire",
+            )
+
+        with h2:
+            st.markdown("**Exploitation**")
+            charges_m2 = st.number_input("Charges copro non récup. (€/m²/an)",
+                                         0, 100, 30, 5)
+            tf_pct = st.slider("Taxe foncière (% du loyer annuel)",
+                               0.0, 20.0, 8.0, .5)
+            vacance = st.slider("Vacance locative (%)", 0.0, 20.0, 4.0, .5)
+            gestion = st.slider("Gestion locative (%)", 0.0, 12.0, 0.0, .5)
+            provision = st.slider("Provision gros travaux (%)",
+                                  0.0, 15.0, 4.0, .5)
+
+        with h3:
+            st.markdown("**Financement**")
+            apport = st.slider("Apport (%)", 0, 100, 20, 5)
+            taux = st.slider("Taux crédit (%)", 0.5, 7.0, 3.60, .05)
+            duree = st.select_slider("Durée (ans)",
+                                     [10, 15, 20, 22, 25], value=20)
+            assur_emp = st.slider("Assurance emprunteur (%)",
+                                  0.0, 1.0, 0.34, .02)
+
+        with h4:
+            st.markdown("**Fiscalité**")
+            regime = st.selectbox(
+                "Régime fiscal",
+                ["LMNP amortissement", "Micro-BIC", "Réel foncier",
+                 "Micro-foncier"],
+                index=0 if meuble == "meublé" else 2,
+            )
+            tmi = st.select_slider("TMI (%)", [0, 11, 30, 41, 45], value=30)
+            part_terrain = st.slider("Part terrain non amort. (%)",
+                                     5, 30, 15, 1)
+            duree_amort = st.slider("Durée amort. bâti (ans)", 20, 40, 30, 1)
+
+        # Cohérence régime / type de location
+        if meuble == "non meublé" and regime in ("LMNP amortissement", "Micro-BIC"):
+            st.warning(
+                "⚠️ Les régimes LMNP / micro-BIC supposent une **location meublée**. "
+                "Basculez le type de location dans la barre latérale, "
+                "ou choisissez un régime foncier."
+            )
+        if meuble == "meublé" and regime in ("Réel foncier", "Micro-foncier"):
+            st.warning(
+                "⚠️ Les régimes fonciers s'appliquent à la location **nue**. "
+                "En meublé, les revenus sont des BIC."
+            )
+
+    H = HypothesesInvest(
+        frais_notaire_pct=frais_notaire, frais_agence_pct=frais_agence,
+        travaux_eur_m2=travaux_m2, mobilier_eur_m2=mobilier_m2,
+        charges_copro_eur_m2_an=charges_m2, taxe_fonciere_pct_loyer=tf_pct,
+        gestion_locative_pct=gestion, vacance_locative_pct=vacance,
+        provision_travaux_pct_loyer=provision,
+        apport_pct=apport, taux_credit_pct=taux, duree_credit_ans=duree,
+        taux_assurance_emprunteur_pct=assur_emp,
+        regime=regime, tmi_pct=tmi, part_terrain_pct=part_terrain,
+        duree_amort_bati_ans=duree_amort,
+    )
+
+    # ─────────────────── PRIX ───────────────────
+    cp1, cp2, cp3 = st.columns([1, 1, 2])
+    with cp1:
+        src_prix = st.radio("Source des prix",
+                            ["DVF (transactions réelles)", "Table statique"],
+                            index=1)
+    with cp2:
+        scenario = st.radio("Scénario de prix",
+                            ["bas", "median", "haut"], index=1,
+                            format_func=lambda s: {
+                                "bas": "🟢 Bas (Q1 — bonne affaire)",
+                                "median": "🟡 Médian",
+                                "haut": "🔴 Haut (Q3)"}[s])
+
+    dvf = load_prix_dvf() if src_prix.startswith("DVF") else None
+    prix_q = prix_par_quartier(agg.assign(
+        arrondissement=agg.get("arrondissement")), dvf)
+
+    with cp3:
+        if dvf is not None and not dvf.empty:
+            n_fiables = int(dvf["fiable"].sum())
+            st.metric("Arrondissements avec échantillon suffisant",
+                      f"{n_fiables}/20",
+                      f"{int(dvf['n_ventes'].sum()):,} ventes retenues".replace(",", " "))
+        else:
+            st.caption("📌 Prix issus de la table de médianes intégrée.")
+
+    # Jointure loyers × prix
+    base_inv = prix_q.merge(
+        agg[["quartier", "loyer_ref", "loyer_max", "loyer_min"]],
+        on="quartier", how="inner",
+    )
+
+    if base_inv.empty:
+        st.error("Jointure loyers/prix vide.")
+        st.stop()
+
+    res = analyser_secteurs(base_inv, surface, complement, H, scenario)
+
+    # ─────────────────── KPI ───────────────────
+    st.divider()
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Rdt brut médian", f"{res['rdt_brut'].median():.2f} %")
+    m2.metric("Rdt net de charges", f"{res['rdt_net'].median():.2f} %")
+    m3.metric("Rdt net-net (fiscal)", f"{res['rdt_net_net'].median():.2f} %")
+    m4.metric("Cashflow médian",
+              f"{res['cashflow_mens'].median():+,.0f} €/m".replace(",", " "),
+              delta_color="normal")
+    n_positif = int((res["cashflow_mens"] > 0).sum())
+    m5.metric("Secteurs autofinancés", f"{n_positif}/{len(res)}")
+
+    # ─────────────────── CARTE RENTABILITÉ ───────────────────
+    st.divider()
+    st.markdown("### 🗺️ Cartographie du rendement")
+
+    ci1, ci2 = st.columns([3, 1])
+
+    with ci2:
+        indic_inv = st.radio(
+            "Indicateur",
+            ["rdt_brut", "rdt_net", "rdt_net_net",
+             "cashflow_mens", "rdt_fonds_propres", "prix_m2"],
+            format_func=lambda k: {
+                "rdt_brut": "Rendement brut (%)",
+                "rdt_net": "Rdt net de charges (%)",
+                "rdt_net_net": "Rdt net-net après impôt (%)",
+                "cashflow_mens": "Cashflow (€/mois)",
+                "rdt_fonds_propres": "Rdt fonds propres (%)",
+                "prix_m2": "Prix d'achat (€/m²)",
+            }[k],
+        )
+        inverse_palette = st.checkbox(
+            "Inverser l'échelle", value=(indic_inv == "prix_m2"),
+            help="Pour le prix, le vert doit signaler le moins cher.",
+        )
+
+    with ci1:
+        vals = res.set_index("quartier")[indic_inv].to_dict()
+        vmin, vmax = min(vals.values()), max(vals.values())
+        if vmin == vmax:
+            vmax = vmin + 1
+
+        cols_pal = ["#d73027", "#fee08b", "#1a9850"]
+        if inverse_palette:
+            cols_pal = cols_pal[::-1]
+        cmap_inv = cm.LinearColormap(cols_pal, vmin=vmin, vmax=vmax).to_step(8)
+        cmap_inv.caption = {
+            "rdt_brut": "Rendement brut (%)",
+            "rdt_net": "Rendement net (%)",
+            "rdt_net_net": "Rendement net-net (%)",
+            "cashflow_mens": "Cashflow (€/mois)",
+            "rdt_fonds_propres": "Rdt fonds propres (%)",
+            "prix_m2": "Prix (€/m²)",
+        }[indic_inv]
+
+        m2map = folium.Map(location=[48.8566, 2.3400], zoom_start=12,
+                           tiles="CartoDB dark_matter")
+
+        lookup_inv = res.set_index("quartier").to_dict("index")
+        feats_inv = []
+        for f in gj["features"]:
+            p = f["properties"]
+            name = (p.get("l_qu") or p.get("nom_quartier")
+                    or p.get("quartier") or "")
+            match = next((k for k in lookup_inv if norm(k) == norm(name)), None)
+            if match is None:
+                continue
+            r = lookup_inv[match]
+            feats_inv.append({
+                "type": "Feature", "geometry": f["geometry"],
+                "properties": {
+                    "quartier": match,
+                    "arr": r["arrondissement"],
+                    "prix": f"{r['prix_m2']:,.0f}".replace(",", " "),
+                    "loyer": f"{r['loyer_m2']:.1f}",
+                    "brut": f"{r['rdt_brut']:.2f}",
+                    "net": f"{r['rdt_net']:.2f}",
+                    "netnet": f"{r['rdt_net_net']:.2f}",
+                    "cf": f"{r['cashflow_mens']:+,.0f}".replace(",", " "),
+                    "cout": f"{r['cout_total']:,.0f}".replace(",", " "),
+                    "value": r[indic_inv],
+                },
+            })
+
+        folium.GeoJson(
+            {"type": "FeatureCollection", "features": feats_inv},
+            style_function=lambda x: {
+                "fillColor": cmap_inv(x["properties"]["value"]),
+                "color": "#222", "weight": .6, "fillOpacity": .82,
+            },
+            highlight_function=lambda x: {"weight": 3, "color": "#fff"},
+            tooltip=folium.GeoJsonTooltip(
+                fields=["quartier", "arr", "prix", "loyer", "brut",
+                        "net", "netnet", "cf", "cout"],
+                aliases=["Quartier", "Arr.", "Prix €/m²", "Loyer majoré €/m²",
+                         "Rdt brut %", "Rdt net %", "Rdt net-net %",
+                         "Cashflow €/m", f"Coût total {surface:g} m² €"],
+                sticky=True,
+                style=("background:#fff;border:1px solid #999;"
+                       "border-radius:5px;padding:8px;font-size:12px;"),
+            ),
+        ).add_to(m2map)
+
+        cmap_inv.add_to(m2map)
+        Fullscreen().add_to(m2map)
+        st_folium(m2map, height=560, width=None,
+                  returned_objects=[], key="map_invest")
+
+    # ─────────────────── CLASSEMENT ───────────────────
+    st.divider()
+    st.markdown("### 🏆 Classement des secteurs")
+
+    cl1, cl2 = st.columns(2)
+    with cl1:
+        tri = st.selectbox("Trier par",
+                           ["rdt_net_net", "rdt_brut", "rdt_net",
+                            "cashflow_mens", "rdt_fonds_propres"],
+                           format_func=lambda k: {
+                               "rdt_net_net": "Rendement net-net",
+                               "rdt_brut": "Rendement brut",
+                               "rdt_net": "Rendement net",
+                               "cashflow_mens": "Cashflow mensuel",
+                               "rdt_fonds_propres": "Rdt fonds propres",
+                           }[k])
+    with cl2:
+        top_n = st.slider("Nombre de secteurs affichés", 5, 80, 20)
+
+    table = (res.sort_values(tri, ascending=False)
+             .head(top_n)[["quartier", "arrondissement", "prix_m2",
+                           "loyer_m2", "cout_total", "loyer_mensuel",
+                           "charges_an", "mensualite", "impot_an",
+                           "rdt_brut", "rdt_net", "rdt_net_net",
+                           "cashflow_mens", "rdt_fonds_propres"]])
+
+    st.dataframe(
+        table, hide_index=True, use_container_width=True, height=480,
+        column_config={
+            "quartier": "Quartier",
+            "arrondissement": st.column_config.NumberColumn("Arr.", format="%d"),
+            "prix_m2": st.column_config.NumberColumn("Prix €/m²", format="%.0f"),
+            "loyer_m2": st.column_config.NumberColumn("Loyer €/m²", format="%.1f"),
+            "cout_total": st.column_config.NumberColumn("Coût total €", format="%.0f"),
+            "loyer_mensuel": st.column_config.NumberColumn("Loyer €/m", format="%.0f"),
+            "charges_an": st.column_config.NumberColumn("Charges €/an", format="%.0f"),
+            "mensualite": st.column_config.NumberColumn("Mensualité €", format="%.0f"),
+            "impot_an": st.column_config.NumberColumn("Impôt €/an", format="%.0f"),
+            "rdt_brut": st.column_config.NumberColumn("Brut %", format="%.2f"),
+            "rdt_net": st.column_config.NumberColumn("Net %", format="%.2f"),
+            "rdt_net_net": st.column_config.ProgressColumn(
+                "Net-net %", format="%.2f",
+                min_value=float(res["rdt_net_net"].min()),
+                max_value=float(res["rdt_net_net"].max())),
+            "cashflow_mens": st.column_config.NumberColumn(
+                "Cashflow €/m", format="%+.0f"),
+            "rdt_fonds_propres": st.column_config.NumberColumn(
+                "Rdt FP %", format="%.1f"),
+        },
+    )
+
+    st.download_button(
+        "⬇️ Export analyse investisseur (CSV)",
+        res.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+        f"rentabilite_paris_{annee}_{int(pieces)}p_{scenario}.csv",
+        "text/csv",
+    )
+
+    # ─────────────────── GRAPHIQUES ───────────────────
+    st.divider()
+    g1, g2 = st.columns(2)
+
+    with g1:
+        st.markdown("#### Prix vs Loyer plafonné")
+        fig = px.scatter(
+            res, x="prix_m2", y="loyer_m2",
+            size=res["rdt_brut"].clip(lower=.1),
+            color="rdt_net_net", hover_name="quartier",
+            color_continuous_scale="RdYlGn",
+            labels={"prix_m2": "Prix €/m²", "loyer_m2": "Loyer majoré €/m²",
+                    "rdt_net_net": "Rdt net-net %"},
+        )
+        # Iso-rendement brut
+        xs = np.linspace(res["prix_m2"].min(), res["prix_m2"].max(), 50)
+        for r_iso in [2.5, 3.5, 4.5, 5.5]:
+            fig.add_scatter(x=xs, y=xs * r_iso / 100 / 12, mode="lines",
+                            line=dict(dash="dot", width=1, color="grey"),
+                            name=f"{r_iso}% brut", hoverinfo="skip")
+        fig.update_layout(height=430, legend=dict(font=dict(size=9)))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with g2:
+        st.markdown("#### Rendement net-net par arrondissement")
+        fig = px.box(res.dropna(subset=["arrondissement"]),
+                     x="arrondissement", y="rdt_net_net",
+                     points="all", hover_name="quartier",
+                     color_discrete_sequence=["#2e7d32"],
+                     labels={"arrondissement": "Arrondissement",
+                             "rdt_net_net": "Rdt net-net %"})
+        fig.add_hline(y=0, line_dash="dash", line_color="red")
+        fig.update_layout(height=430)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Décomposition du rendement (waterfall)
+    st.markdown("#### Décomposition brut → net-net")
+    q_sel = st.selectbox("Secteur analysé",
+                         res.sort_values("rdt_net_net", ascending=False)["quartier"])
+    r = res[res["quartier"] == q_sel].iloc[0]
+
+    fig = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=["absolute", "relative", "relative", "relative",
+                 "relative", "total"],
+        x=["Loyer brut", "Vacance/impayés", "Charges",
+           "Intérêts + assur.", "Impôt", "Net après crédit"],
+        y=[r["loyer_brut_an"],
+           -(r["loyer_brut_an"] - r["loyer_encaisse_an"]),
+           -r["charges_an"], -(r["annuite"]), -r["impot_an"], 0],
+        text=[f"{v:,.0f} €".replace(",", " ") for v in
+              [r["loyer_brut_an"],
+               -(r["loyer_brut_an"] - r["loyer_encaisse_an"]),
+               -r["charges_an"], -r["annuite"], -r["impot_an"],
+               r["cashflow_an"]]],
+        connector=dict(line=dict(color="grey")),
+        increasing=dict(marker_color="#2e7d32"),
+        decreasing=dict(marker_color="#c62828"),
+        totals=dict(marker_color="#1565c0"),
+    ))
+    fig.update_layout(height=400, yaxis_title="€ / an",
+                      title=f"{q_sel} — {surface:g} m², {int(pieces)} p., {meuble}")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ─────────────────── MONTE-CARLO ───────────────────
+    st.divider()
+    st.markdown("### 🎲 Analyse de sensibilité (Monte-Carlo)")
+    st.caption(
+        "Le prix d'achat est tiré dans la fourchette Q1–Q3 observée, "
+        "avec un bruit sur la vacance et les charges. "
+        "Montre la **distribution réaliste** du rendement plutôt qu'une valeur unique."
+    )
+
+    mc1, mc2 = st.columns([1, 3])
+    with mc1:
+        q_mc = st.selectbox("Secteur", sorted(res["quartier"]), key="mc_q")
+        n_sim = st.select_slider("Simulations", [500, 1000, 2000, 5000],
+                                 value=1000)
+        lancer = st.button("▶️ Lancer", type="primary")
+
+    if lancer:
+        rr = res[res["quartier"] == q_mc].iloc[0]
+        with st.spinner("Simulation…"):
+            mc = monte_carlo(rr["prix_bas"], rr["prix_haut"], rr["loyer_m2"],
+                             surface, complement, H, n=n_sim)
+        with mc2:
+            f1, f2 = st.columns(2)
+            with f1:
+                fig = px.histogram(mc, x="rdt_net_net", nbins=40,
+                                   color_discrete_sequence=["#1565c0"],
+                                   labels={"rdt_net_net": "Rdt net-net %"})
+                for q, c in [(.1, "orange"), (.5, "black"), (.9, "green")]:
+                    fig.add_vline(x=mc["rdt_net_net"].quantile(q),
+                                  line_dash="dash", line_color=c,
+                                  annotation_text=f"P{int(q*100)}")
+                fig.update_layout(height=320, bargap=.03)
+                st.plotly_chart(fig, use_container_width=True)
+            with f2:
+                fig = px.histogram(mc, x="cashflow_mens", nbins=40,
+                                   color_discrete_sequence=["#6a1b9a"],
+                                   labels={"cashflow_mens": "Cashflow €/mois"})
+                fig.add_vline(x=0, line_color="red", line_width=2)
+                fig.update_layout(height=320, bargap=.03)
+                st.plotly_chart(fig, use_container_width=True)
+
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Rdt net-net P10", f"{mc['rdt_net_net'].quantile(.1):.2f} %")
+        s2.metric("Médiane", f"{mc['rdt_net_net'].median():.2f} %")
+        s3.metric("P90", f"{mc['rdt_net_net'].quantile(.9):.2f} %")
+        s4.metric("Proba cashflow > 0",
+                  f"{(mc['cashflow_mens'] > 0).mean()*100:.0f} %")
+
+    # ─────────────────── AVERTISSEMENT ───────────────────
+    st.divider()
 st.divider()
 st.caption(
     "⚖️ Outil informatif — ne constitue pas un conseil juridique. "
